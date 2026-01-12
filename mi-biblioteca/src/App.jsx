@@ -5,7 +5,7 @@ import {
   BookOpen, Flame, CheckCircle2, Sparkles, CalendarDays, Download, 
   Share, HelpCircle, ChevronRight, ChevronDown, Wifi, WifiOff, 
   RefreshCw, Globe, LayoutGrid, Columns, Tag, Filter, ArrowUpDown, 
-  GripHorizontal, Play, LogOut, Lock
+  GripHorizontal, Play, LogOut, Lock, CloudOff
 } from 'lucide-react';
 
 // --- FIREBASE IMPORTS ---
@@ -25,12 +25,14 @@ import {
   doc, 
   setDoc, 
   deleteDoc, 
-  orderBy,
+  orderBy, 
   updateDoc,
-  writeBatch // <-- Importamos writeBatch para la migración
+  writeBatch,
+  enableIndexedDbPersistence // Importante para offline
 } from "firebase/firestore";
 
 // --- FIREBASE CONFIG ---
+// Usamos la variable global proporcionada por el entorno en lugar de import.meta.env
 const firebaseConfig = {
   apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
   authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
@@ -40,10 +42,26 @@ const firebaseConfig = {
   appId: import.meta.env.VITE_FIREBASE_APP_ID
 };
 
+
 // Initialize Firebase
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
+
+// --- ACTIVAR PERSISTENCIA OFFLINE ---
+// Intentamos activar la persistencia de Firestore. 
+// Esto permite que la app funcione sin internet usando una base de datos local IndexDB.
+try {
+  enableIndexedDbPersistence(db).catch((err) => {
+    if (err.code == 'failed-precondition') {
+      console.log('La persistencia falló: Probablemente múltiples pestañas abiertas.');
+    } else if (err.code == 'unimplemented') {
+      console.log('El navegador no soporta persistencia.');
+    }
+  });
+} catch (e) {
+  console.log("Error inicializando persistencia:", e);
+}
 
 // --- UTILIDADES ---
 
@@ -204,11 +222,13 @@ export default function App() {
   const [user, setUser] = useState(null);
   const [authLoading, setAuthLoading] = useState(true);
 
+  // --- ONLINE STATE ---
+  const [isOnline, setIsOnline] = useState(navigator.onLine);
+
   // --- APP STATES ---
   const [currentTheme, setCurrentTheme] = useState(() => localStorage.getItem('library_theme') || 'modern');
   const theme = themes[currentTheme];
 
-  // Datos ahora se inician vacíos, se llenarán con Firestore
   const [books, setBooks] = useState([]);
   const [readingSessions, setReadingSessions] = useState([]);
   const [readDates, setReadDates] = useState([]);
@@ -222,7 +242,7 @@ export default function App() {
   const [searchTerm, setSearchTerm] = useState('');
   
   const [selectedGenre, setSelectedGenre] = useState('Todos');
-  const [sortBy, setSortBy] = useState('custom'); // Cambiado a custom por defecto
+  const [sortBy, setSortBy] = useState('custom'); 
   const [showSortDropdown, setShowSortDropdown] = useState(false);
   
   const [draggedBookId, setDraggedBookId] = useState(null);
@@ -236,8 +256,6 @@ export default function App() {
   const [isThemeModalOpen, setIsThemeModalOpen] = useState(false);
   const [showStreakSuccess, setShowStreakSuccess] = useState(false); 
   const [showInstallHelp, setShowInstallHelp] = useState(false); 
-  const [showSyncModal, setShowSyncModal] = useState(false);
-  const [isSyncing, setIsSyncing] = useState(false);
   
   const [manualSearchResults, setManualSearchResults] = useState([]);
   const [isManualSearching, setIsManualSearching] = useState(false);
@@ -270,9 +288,28 @@ export default function App() {
     (b.author && b.author.toLowerCase().includes(sessionSearchTerm.toLowerCase()))
   );
 
+  // --- NETWORK DETECTION ---
+  useEffect(() => {
+    const handleOnline = () => setIsOnline(true);
+    const handleOffline = () => setIsOnline(false);
+
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+    };
+  }, []);
+
   // --- API ---
   const fetchBookData = async (title) => {
-    if (!navigator.onLine) return null;
+    // OFFLINE GUARD: No llamar a API si no hay internet
+    if (!isOnline) {
+      console.log("Modo offline: Saltando búsqueda API");
+      return null;
+    }
+    
     try {
       const response = await fetch(`https://www.googleapis.com/books/v1/volumes?q=${encodeURIComponent(title)}`);
       const data = await response.json();
@@ -300,7 +337,7 @@ export default function App() {
     return () => unsubscribe();
   }, []);
 
-  // 2. MIGRACIÓN DE DATOS LOCALES A FIRESTORE
+  // 2. MIGRACIÓN DE DATOS LOCALES A FIRESTORE (Legacy)
   useEffect(() => {
     if (!user) return;
 
@@ -308,7 +345,6 @@ export default function App() {
       const localBooksStr = localStorage.getItem('my_books_v3');
       const localSessionsStr = localStorage.getItem('my_reading_sessions');
 
-      // Si no hay datos locales, no hacemos nada
       if (!localBooksStr && !localSessionsStr) return;
 
       const batch = writeBatch(db);
@@ -319,9 +355,7 @@ export default function App() {
         try {
           const localBooks = JSON.parse(localBooksStr);
           localBooks.forEach(book => {
-            // Usamos el mismo ID que tenía localmente
             const docRef = doc(db, 'users', user.uid, 'books', book.id);
-            // Aseguramos que tenga un campo 'order'
             const bookData = { ...book, order: book.order || Date.now() };
             batch.set(docRef, bookData);
             migrationCount++;
@@ -341,21 +375,15 @@ export default function App() {
         } catch (e) { console.error("Error parsing local sessions", e); }
       }
 
-      // Ejecutar la migración
       if (migrationCount > 0) {
         try {
           await batch.commit();
-          console.log("Migración completada con éxito.");
-          
-          // Limpiamos localStorage para no migrar de nuevo en el futuro
           localStorage.removeItem('my_books_v3');
           localStorage.removeItem('my_reading_sessions');
           localStorage.removeItem('my_reading_dates'); 
-          
           alert(`¡Sincronización completada! Hemos movido ${migrationCount} elementos de tu dispositivo a la nube.`);
         } catch (error) {
           console.error("Error durante la migración:", error);
-          // Si falla, no borramos el localStorage para intentarlo de nuevo luego.
         }
       }
     };
@@ -364,6 +392,8 @@ export default function App() {
   }, [user]);
 
   // 3. Sync Firestore Data (Books & Sessions)
+  // Con soporte offline: Al usar enableIndexedDbPersistence, onSnapshot
+  // funcionará con los datos locales si no hay red.
   useEffect(() => {
     if (!user) {
       setBooks([]);
@@ -372,26 +402,46 @@ export default function App() {
       return;
     }
 
+    // Estrategia de Backup en LocalStorage:
+    // Aunque Firestore maneja persistencia, en entornos iframe o con políticas estrictas puede fallar.
+    // Mantenemos una copia en localStorage por seguridad extra.
+
     // Libros
     const booksQuery = query(collection(db, 'users', user.uid, 'books'));
-    const unsubscribeBooks = onSnapshot(booksQuery, (snapshot) => {
+    const unsubscribeBooks = onSnapshot(booksQuery, { includeMetadataChanges: true }, (snapshot) => {
       const loadedBooks = snapshot.docs.map(doc => doc.data());
-      // Ordenar por campo 'order' si existe, o por fecha de añadido
       loadedBooks.sort((a, b) => (a.order || 0) - (b.order || 0));
       setBooks(loadedBooks);
+      
+      // Backup Local
+      localStorage.setItem(`backup_books_${user.uid}`, JSON.stringify(loadedBooks));
+    }, (error) => {
+        console.error("Error Firestore Books (Offline Fallback):", error);
+        // Si Firestore falla completamente, cargamos backup
+        const backup = localStorage.getItem(`backup_books_${user.uid}`);
+        if(backup) setBooks(JSON.parse(backup));
     });
 
     // Sesiones
     const sessionsQuery = query(collection(db, 'users', user.uid, 'sessions'));
-    const unsubscribeSessions = onSnapshot(sessionsQuery, (snapshot) => {
+    const unsubscribeSessions = onSnapshot(sessionsQuery, { includeMetadataChanges: true }, (snapshot) => {
       const loadedSessions = snapshot.docs.map(doc => doc.data());
-      // Ordenar por fecha descendente para la UI
       loadedSessions.sort((a, b) => new Date(b.date) - new Date(a.date));
       setReadingSessions(loadedSessions);
       
-      // Calcular fechas leídas
       const dates = loadedSessions.map(s => s.date);
       setReadDates(dates);
+
+      // Backup Local
+      localStorage.setItem(`backup_sessions_${user.uid}`, JSON.stringify(loadedSessions));
+    }, (error) => {
+        console.error("Error Firestore Sessions (Offline Fallback):", error);
+        const backup = localStorage.getItem(`backup_sessions_${user.uid}`);
+        if(backup) {
+            const parsed = JSON.parse(backup);
+            setReadingSessions(parsed);
+            setReadDates(parsed.map(s => s.date));
+        }
     });
 
     return () => {
@@ -446,6 +496,12 @@ export default function App() {
   useEffect(() => {
     const timer = setTimeout(async () => {
       if (bookForm.title.length > 2 && showSuggestions && !editingBookId && !manualSearchResults.length) { 
+        // OFFLINE GUARD: No buscar sugerencias si offline
+        if (!isOnline) {
+            setSuggestions([]);
+            return;
+        }
+
         setIsTyping(true);
         try {
           const response = await fetch(`https://www.googleapis.com/books/v1/volumes?q=${encodeURIComponent(bookForm.title)}&maxResults=5`);
@@ -457,13 +513,17 @@ export default function App() {
       } else { setSuggestions([]); setIsTyping(false); }
     }, 500);
     return () => clearTimeout(timer);
-  }, [bookForm.title, showSuggestions, editingBookId, manualSearchResults]);
+  }, [bookForm.title, showSuggestions, editingBookId, manualSearchResults, isOnline]);
 
   const hasReadToday = readDates.includes(getLocalDateString());
 
   // --- HANDLERS ---
 
   const handleLogin = async () => {
+    if (!isOnline) {
+        alert("Necesitas conexión a internet para iniciar sesión.");
+        return;
+    }
     const provider = new GoogleAuthProvider();
     try {
       await signInWithPopup(auth, provider);
@@ -475,7 +535,6 @@ export default function App() {
   const handleLogout = async () => {
     try {
       await signOut(auth);
-      // Limpiar estados locales
       setBooks([]);
       setReadingSessions([]);
       setUser(null);
@@ -486,6 +545,7 @@ export default function App() {
 
   const handleManualSearch = async () => {
     if (!bookForm.title) return;
+    if (!isOnline) { alert("Esta función requiere internet."); return; }
     setIsManualSearching(true); setSuggestions([]); 
     try {
         const response = await fetch(`https://www.googleapis.com/books/v1/volumes?q=${encodeURIComponent(bookForm.title)}&maxResults=5`);
@@ -511,13 +571,13 @@ export default function App() {
     const book = books.find(b => b.id === bookId);
     if (book) {
       try {
+        // Firestore maneja la escritura offline automáticamente (lo pone en cola)
         await updateDoc(doc(db, 'users', user.uid, 'books', bookId), {
           isFavorite: !book.isFavorite
         });
       } catch (err) { console.error("Error fav", err); }
     }
     
-    // Update local selected book state if needed
     if (selectedBook && selectedBook.id === bookId) setSelectedBook(prev => ({ ...prev, isFavorite: !prev.isFavorite }));
   };
 
@@ -542,11 +602,19 @@ export default function App() {
     };
 
     try {
+      // Escritura en Firestore (funciona offline gracias a persistencia)
       await setDoc(doc(db, 'users', user.uid, 'sessions', newSession.id), newSession);
-      if (!readDates.includes(today)) { setShowStreakSuccess(true); } else alert("¡Lectura registrada! 🚀");
+      
+      if (!readDates.includes(today)) { setShowStreakSuccess(true); } 
+      else {
+          // Feedback diferente si es offline
+          if (isOnline) alert("¡Lectura registrada! 🚀");
+          else alert("¡Lectura guardada offline! Se sincronizará al conectar. ☁️");
+      }
       setIsSessionModalOpen(false);
     } catch (err) {
       console.error("Error saving session", err);
+      // Fallback manual si falla la escritura (raro con persistencia activada)
       alert("Error al guardar sesión");
     }
   };
@@ -570,8 +638,8 @@ export default function App() {
     e.preventDefault(); if (!bookForm.title || !user) return; setIsSearching(true); 
     let finalData = { ...bookForm };
     
-    // Fetch extra data if missing
-    if ((!finalData.coverUrl || !finalData.author) && !editingBookId) {
+    // Fetch extra data if missing AND online
+    if (isOnline && (!finalData.coverUrl || !finalData.author) && !editingBookId) {
        const apiData = await fetchBookData(bookForm.title);
        if (apiData) finalData = { ...finalData, coverUrl: finalData.coverUrl || apiData.coverUrl, author: finalData.author || apiData.author, genre: finalData.genre || apiData.genre, pageCount: apiData.pageCount };
     }
@@ -581,7 +649,6 @@ export default function App() {
         await setDoc(doc(db, 'users', user.uid, 'books', editingBookId), finalData, { merge: true });
       } else {
         const newId = generateId();
-        // Asignamos un orden basado en timestamp para que aparezcan al final por defecto
         await setDoc(doc(db, 'users', user.uid, 'books', newId), { 
           id: newId, 
           ...finalData, 
@@ -589,6 +656,9 @@ export default function App() {
           order: Date.now() 
         });
       }
+      
+      if (!isOnline) alert("Libro guardado en modo offline. Se sincronizará cuando vuelvas a tener internet.");
+      
       setIsBookModalOpen(false);
     } catch (err) {
       console.error("Error saving book", err);
@@ -615,7 +685,6 @@ export default function App() {
     e.preventDefault(); 
     if (!draggedBookId || draggedBookId === targetBookId || !user) return;
     
-    // 1. Reordenamiento local optimista para feedback inmediato
     const sourceIndex = books.findIndex(b => b.id === draggedBookId);
     const targetIndex = books.findIndex(b => b.id === targetBookId);
     if (sourceIndex === -1 || targetIndex === -1) return;
@@ -624,20 +693,14 @@ export default function App() {
     const [movedBook] = newBooks.splice(sourceIndex, 1);
     newBooks.splice(targetIndex, 0, movedBook);
     
-    // Ajustar sort para que refleje el cambio manual
     if (sortBy !== 'custom') setSortBy('custom');
     setDraggedBookId(null);
-    setBooks(newBooks); // Update UI immediately
+    setBooks(newBooks); 
 
-    // 2. Persistencia en Firestore (Actualizar el campo 'order' de los afectados)
-    // Para simplificar, reasignamos timestamps/indices a todo el array reordenado
-    // Esto genera muchas escrituras, pero garantiza el orden. 
-    // En una app real de producción, usaríamos índices fraccionarios o linked lists.
     const batchUpdates = newBooks.map((book, index) => {
        return setDoc(doc(db, 'users', user.uid, 'books', book.id), { order: index }, { merge: true });
     });
     
-    // No esperamos el resultado para no bloquear la UI
     Promise.all(batchUpdates).catch(err => console.error("Error reordering", err));
   };
 
@@ -646,7 +709,7 @@ export default function App() {
     const matchesGenre = selectedGenre === 'Todos' || (book.genre && book.genre === selectedGenre);
     return matchesSearch && matchesGenre;
   }).sort((a, b) => {
-    if (sortBy === 'custom') return 0; // El orden ya viene dado por el array (que viene ordenado por 'order' desde firestore)
+    if (sortBy === 'custom') return 0; 
     if (sortBy === 'favorites') { if (a.isFavorite === b.isFavorite) return a.title.localeCompare(b.title); return a.isFavorite ? -1 : 1; }
     if (sortBy === 'author') return (a.author || '').localeCompare(b.author || '');
     return a.title.localeCompare(b.title);
@@ -679,10 +742,20 @@ export default function App() {
           
           <button 
             onClick={handleLogin}
-            className="w-full bg-white border border-slate-200 text-slate-700 font-bold py-4 rounded-xl shadow-lg hover:bg-slate-50 transition-all flex items-center justify-center gap-3 active:scale-[0.98]"
+            disabled={!isOnline}
+            className={`w-full bg-white border border-slate-200 text-slate-700 font-bold py-4 rounded-xl shadow-lg transition-all flex items-center justify-center gap-3 active:scale-[0.98] ${!isOnline ? 'opacity-50 cursor-not-allowed' : 'hover:bg-slate-50'}`}
           >
-            <img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg" className="w-6 h-6" alt="Google" />
-            Continuar con Google
+            {isOnline ? (
+                <>
+                <img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg" className="w-6 h-6" alt="Google" />
+                Continuar con Google
+                </>
+            ) : (
+                <>
+                <WifiOff size={20} />
+                Sin Conexión (Requiere Internet para Login)
+                </>
+            )}
           </button>
           
           <p className="mt-8 text-xs text-slate-400">
@@ -754,6 +827,14 @@ export default function App() {
         <div className="max-w-5xl mx-auto flex justify-between items-center">
           <div className="flex items-center gap-3"><div className={`w-10 h-10 rounded-full ${theme.colors.accent} flex items-center justify-center text-white shadow-lg`}><Library size={20} /></div><div><h1 className={`text-lg font-bold ${theme.colors.text} leading-tight`}>Hola, {user.displayName ? user.displayName.split(' ')[0] : 'Lectora'}</h1><p className={`text-xs ${theme.colors.subtext}`}>Tu espacio personal</p></div></div>
           <div className="flex gap-2 items-center">
+             {/* Indicador Offline */}
+             {!isOnline && (
+                 <div className="hidden sm:flex items-center gap-1.5 px-3 py-1.5 bg-rose-100 text-rose-700 rounded-full text-xs font-bold border border-rose-200">
+                     <WifiOff size={14} />
+                     Offline
+                 </div>
+             )}
+
              {!isInstalled && <button onClick={handleInstallClick} className={`p-2 rounded-full border ${theme.colors.border} text-emerald-600 bg-emerald-50 hover:bg-emerald-100 transition-colors ${deferredPrompt ? 'animate-pulse' : ''}`} aria-label="Instalar App">{deferredPrompt ? <Download size={20} /> : <HelpCircle size={20} />}</button>}
              <button onClick={() => setIsThemeModalOpen(!isThemeModalOpen)} className={`p-2 rounded-full border ${theme.colors.border} ${theme.colors.text} hover:bg-slate-100/50 transition-colors`} aria-label="Tema"><Palette size={20} /></button>
              <button onClick={handleLogout} className={`p-2 rounded-full border ${theme.colors.border} text-rose-500 hover:bg-rose-50 transition-colors`} aria-label="Cerrar Sesión"><LogOut size={20} /></button>
@@ -761,6 +842,12 @@ export default function App() {
              {renderStreakIndicator()}
           </div>
         </div>
+        {/* Banner Offline Móvil */}
+        {!isOnline && (
+            <div className="sm:hidden mt-3 mx-auto max-w-xs flex items-center justify-center gap-2 text-[10px] font-bold text-rose-600 bg-rose-50 border border-rose-100 py-1 px-3 rounded-full">
+                <WifiOff size={12}/> Modo Offline: Datos locales
+            </div>
+        )}
       </header>
 
       {/* BODY CONTENT */}
@@ -945,7 +1032,17 @@ export default function App() {
                     <div className="flex justify-between items-center mb-8"><h2 className={`text-2xl font-bold ${theme.colors.text}`}>{editingBookId ? 'Editar Libro' : 'Nuevo Libro'}</h2><button onClick={() => setIsBookModalOpen(false)} className={`p-2 rounded-full bg-slate-100 hover:bg-slate-200 ${theme.colors.subtext}`} type="button"><X size={20} /></button></div>
                     <form onSubmit={handleSaveBook} className="space-y-6">
                         <div className="flex justify-center mb-4"><div className="relative group cursor-pointer" onClick={() => fileInputRef.current?.click()} onKeyDown={(e) => e.key === 'Enter' && fileInputRef.current?.click()} role="button" tabIndex={0} aria-label="Subir portada">{bookForm.coverUrl ? <img src={bookForm.coverUrl} className="w-32 h-48 object-cover rounded-xl shadow-lg border-2 border-white ring-1 ring-slate-200" alt="Portada" /> : <div className={`w-32 h-48 ${theme.colors.bg} rounded-xl border-2 border-dashed ${theme.colors.border} flex flex-col items-center justify-center ${theme.colors.subtext} hover:border-indigo-400 transition-colors`}><Camera size={28} className="mb-2 opacity-50"/><span className="text-[10px] font-bold uppercase tracking-wider">Subir Foto</span></div>}<input type="file" ref={fileInputRef} className="hidden" accept="image/*" onChange={handleImageUpload} /></div></div>
-                        <div className="mb-4"><button type="button" onClick={handleManualSearch} disabled={!bookForm.title || isManualSearching} className={`w-full py-2.5 rounded-xl text-sm font-bold border-2 border-dashed ${theme.colors.border} text-indigo-500 hover:bg-indigo-50 hover:border-indigo-200 transition-all flex items-center justify-center gap-2`}>{isManualSearching ? <Loader2 size={16} className="animate-spin" /> : <Globe size={16} />} Buscar Portada y Datos en Línea</button></div>
+                        <div className="mb-4">
+                            <button 
+                                type="button" 
+                                onClick={handleManualSearch} 
+                                disabled={!bookForm.title || isManualSearching || !isOnline} 
+                                className={`w-full py-2.5 rounded-xl text-sm font-bold border-2 border-dashed ${theme.colors.border} transition-all flex items-center justify-center gap-2 ${!isOnline ? 'bg-slate-100 text-slate-400 cursor-not-allowed' : 'text-indigo-500 hover:bg-indigo-50 hover:border-indigo-200'}`}
+                            >
+                                {isManualSearching ? <Loader2 size={16} className="animate-spin" /> : (!isOnline ? <WifiOff size={16}/> : <Globe size={16} />)} 
+                                {isOnline ? "Buscar Portada y Datos en Línea" : "Sin conexión: Añade manualmente"}
+                            </button>
+                        </div>
                         {manualSearchResults.length > 0 && <div className="mb-6 space-y-2 bg-slate-50 p-2 rounded-xl border border-slate-200 max-h-60 overflow-y-auto"><p className="text-xs font-bold text-slate-400 uppercase tracking-wider px-2 mb-1">Resultados encontrados:</p>{manualSearchResults.map((book) => (<button key={book.id} type="button" onClick={() => handleSelectManualResult(book)} className="w-full flex items-center gap-3 p-2 hover:bg-white rounded-lg border border-transparent hover:border-slate-200 transition-all text-left group">{book.volumeInfo.imageLinks?.thumbnail ? <img src={book.volumeInfo.imageLinks.thumbnail} className="w-10 h-14 object-cover rounded shadow-sm group-hover:shadow-md" alt="" /> : <div className="w-10 h-14 bg-slate-200 rounded flex items-center justify-center text-slate-400"><Book size={16} /></div>}<div className="overflow-hidden"><p className="font-bold text-sm text-slate-800 truncate">{book.volumeInfo.title}</p><p className="text-xs text-slate-500 truncate">{book.volumeInfo.authors?.[0] || 'Autor desconocido'}</p></div><ChevronRight size={16} className="ml-auto text-slate-300 group-hover:text-indigo-500" /></button>))}</div>}
                         <div className="space-y-4">
                             <div className="relative" ref={suggestionsRef}><label className={`block text-xs font-bold ${theme.colors.subtext} uppercase mb-2 ml-1`}>Título</label><div className="relative"><input className={`w-full ${theme.colors.input} rounded-xl p-4 ${theme.colors.text} outline-none border-2 border-transparent focus:border-indigo-500/20 focus:ring-4 focus:ring-indigo-500/10 transition-all pl-12 font-medium`} value={bookForm.title} onChange={e => { setBookForm({...bookForm, title: e.target.value}); setShowSuggestions(true); }} placeholder="Ej. Cien Años de Soledad"/><div className="absolute left-4 top-4 text-slate-400">{isTyping ? <Loader2 size={20} className={`animate-spin ${theme.colors.highlight}`} /> : <Search size={20} />}</div></div>{showSuggestions && suggestions.length > 0 && !editingBookId && !manualSearchResults.length && <ul className={`absolute z-50 left-0 right-0 mt-2 ${theme.colors.card} rounded-xl shadow-2xl border ${theme.colors.border} max-h-48 overflow-y-auto p-2`}>{suggestions.map((book) => (<li key={book.id} onClick={() => handleSelectSuggestion(book)} className={`flex items-center gap-3 p-3 hover:bg-slate-50 rounded-lg cursor-pointer transition-colors`}>{book.volumeInfo.imageLinks?.thumbnail && <img src={book.volumeInfo.imageLinks.thumbnail} className="w-8 h-12 object-cover rounded" alt="" />}<div><p className={`font-bold text-sm ${theme.colors.text} line-clamp-1`}>{book.volumeInfo.title}</p><p className={`text-xs ${theme.colors.subtext}`}>{book.volumeInfo.authors?.[0]}</p></div></li>))}</ul>}</div>
@@ -954,12 +1051,12 @@ export default function App() {
                             <div><label className={`block text-xs font-bold ${theme.colors.subtext} uppercase mb-2 ml-1`}>Color del Lomo</label><div className="flex gap-2 overflow-x-auto pb-2">{bookColors.map((colorClass, idx) => (<button key={idx} type="button" onClick={() => setBookForm({ ...bookForm, color: colorClass })} className={`w-8 h-8 rounded-full border-2 ${colorClass.split(' ')[0]} ${bookForm.color === colorClass ? 'border-indigo-500 scale-110' : 'border-transparent opacity-70 hover:opacity-100'}`}/>))}</div></div>
                             <div><label className={`block text-xs font-bold ${theme.colors.subtext} uppercase mb-2 ml-1`}>Tu Valoración</label><div className={`flex justify-between ${theme.colors.input} p-4 rounded-xl border ${theme.colors.border}`}>{ [1, 2, 3, 4, 5].map((num) => (<button type="button" key={num} onClick={() => setBookForm({...bookForm, rating: num})} className="transform transition-transform active:scale-90 hover:scale-110"><Star size={28} className={num <= bookForm.rating ? "fill-yellow-400 text-yellow-400 drop-shadow-sm" : "text-slate-200 fill-slate-200"}/></button>))}</div></div>
                         </div>
-                        <button type="submit" disabled={isSearching} className={`w-full ${theme.colors.accent} ${theme.colors.accentHover} text-white font-bold py-4 rounded-xl shadow-lg shadow-indigo-500/20 transition-all transform active:scale-[0.98] mt-4`}>{isSearching ? <Loader2 className="animate-spin mx-auto" /> : "Guardar Libro"}</button>
+                        <button type="submit" disabled={isSearching} className={`w-full ${theme.colors.accent} ${theme.colors.accentHover} text-white font-bold py-4 rounded-xl shadow-lg shadow-indigo-500/20 transition-all transform active:scale-[0.98] mt-4`}>{isSearching ? <Loader2 className="animate-spin mx-auto" /> : (isOnline ? "Guardar Libro" : "Guardar Offline")}</button>
                     </form>
                 </div>
             )}
 
-            {/* MODAL REGISTRAR LECTURA (NUEVO DISEÑO CON SELECTOR CUSTOM) */}
+            {/* MODAL REGISTRAR LECTURA */}
             {isSessionModalOpen && (
                 <div className={`${theme.colors.card} w-full max-w-sm rounded-3xl p-8 shadow-2xl animate-in zoom-in-95`}>
                     <div className="flex justify-between items-center mb-8"><div><h2 className={`text-2xl font-bold ${theme.colors.text}`}>Registrar</h2><p className={`text-xs ${theme.colors.subtext} font-medium uppercase tracking-wide`}>Sesión de Lectura</p></div><button onClick={() => setIsSessionModalOpen(false)} className={`p-2 rounded-full bg-slate-100 hover:bg-slate-200 ${theme.colors.subtext}`} type="button"><X size={20} /></button></div>
@@ -1041,7 +1138,9 @@ export default function App() {
 
                         <div><label className={`block text-xs font-bold ${theme.colors.subtext} uppercase mb-2 ml-1`}>Tiempo (Minutos)</label><div className="flex gap-3 mb-3">{['15', '30', '45', '60'].map(min => (<button key={min} type="button" onClick={() => setSessionForm({...sessionForm, duration: min})} className={`flex-1 py-3 rounded-xl text-sm font-bold border-2 transition-all ${sessionForm.duration === min ? `${theme.colors.accent} border-transparent text-white shadow-md` : `${theme.colors.bg} border-transparent hover:border-slate-200 ${theme.colors.subtext}`}`}>{min}</button>))}</div><input type="number" placeholder="Otro tiempo..." className={`w-full mt-2 ${theme.colors.input} rounded-xl p-4 text-sm ${theme.colors.text} outline-none border-2 border-transparent focus:border-indigo-500/20 focus:ring-4 focus:ring-indigo-500/10`} value={sessionForm.duration} onChange={e => setSessionForm({...sessionForm, duration: e.target.value})}/></div>
                         <div><label className={`block text-xs font-bold ${theme.colors.subtext} uppercase mb-2 ml-1`}>Notas (Opcional)</label><textarea className={`w-full ${theme.colors.input} rounded-xl p-4 ${theme.colors.text} outline-none resize-none h-28 text-sm border-2 border-transparent focus:border-indigo-500/20 focus:ring-4 focus:ring-indigo-500/10`} placeholder="¿Qué parte te gustó más hoy?" value={sessionForm.note} onChange={e => setSessionForm({...sessionForm, note: e.target.value})}/></div>
-                        <button type="submit" className={`w-full ${theme.colors.accent} ${theme.colors.accentHover} text-white font-bold py-4 rounded-xl shadow-lg shadow-indigo-500/20 transition-all transform active:scale-[0.98]`}>Guardar Progreso</button>
+                        <button type="submit" className={`w-full ${theme.colors.accent} ${theme.colors.accentHover} text-white font-bold py-4 rounded-xl shadow-lg shadow-indigo-500/20 transition-all transform active:scale-[0.98]`}>
+                            {isOnline ? "Guardar Progreso" : "Guardar Offline"}
+                        </button>
                     </form>
                 </div>
             )}
